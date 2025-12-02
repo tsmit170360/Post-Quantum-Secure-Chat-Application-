@@ -1,8 +1,5 @@
 # Post-Quantum Secure Chat Application 🛡️
 
-**Assignment 5 - Network Security Lab**
-**Group 6**
-
 A full-stack, real-time messaging application secured using **Post-Quantum Cryptography (PQC)**. This project implements a **Hybrid Encryption** scheme combining **ML-KEM-512 (Kyber)** for key exchange and **AES-GCM** for message encryption, ensuring protection against both classical and future quantum threats.
 
 ## 🌟 Key Features
