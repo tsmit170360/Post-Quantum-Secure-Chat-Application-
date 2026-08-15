@@ -1,23 +1,33 @@
-import dbConnect from '../../../lib/dbConnect'; // Update path if needed (e.g., lib/dbConnect)
+import { withAuth } from '../../../lib/auth';
+import dbConnect from '../../../lib/dbConnect';
+import { isLookupableUsername } from '../../../lib/validation';
 import User from '../../../models/User';
 
-export default async function handler(req, res) {
-  const { username } = req.query;
-
-  if (req.method !== 'GET') return res.status(405).end();
+/**
+ * Returns a user's Kyber public key.
+ *
+ * Authenticated so the endpoint cannot be used for anonymous account
+ * enumeration; the key itself is public by design.
+ */
+async function handler(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
     await dbConnect();
-    // Find user and ONLY return the public key (exclude password)
-    const user = await User.findOne({ username }).select('pqcPublicKey');
 
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+    const { username } = req.query;
+    if (!isLookupableUsername(username)) {
+      return res.status(400).json({ error: 'Invalid username' });
     }
 
-    res.status(200).json({ pqcPublicKey: user.pqcPublicKey });
+    const user = await User.findOne({ username }).select('pqcPublicKey').lean();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    return res.status(200).json({ pqcPublicKey: user.pqcPublicKey });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Server error fetching key' });
+    console.error('Fetch public key error:', error);
+    return res.status(500).json({ error: 'Server error fetching key' });
   }
 }
+
+export default withAuth(handler);

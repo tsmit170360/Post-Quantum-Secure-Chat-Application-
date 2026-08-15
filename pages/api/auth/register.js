@@ -1,32 +1,51 @@
-import dbConnect from '../../../lib/dbConnect'; // Check if your folder is named 'utils' or 'lib'
-import User from '../../../models/User';
 import bcrypt from 'bcryptjs';
 
+import dbConnect from '../../../lib/dbConnect';
+import { enforce } from '../../../lib/rateLimit';
+import { validateNewCredentials, validatePublicKey } from '../../../lib/validation';
+import User from '../../../models/User';
+
+const BCRYPT_COST = 12;
+
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  if (!enforce(req, res, { scope: 'register', limit: 5, windowMs: 60 * 60 * 1000 })) {
+    return undefined;
+  }
+
+  const { username, password, pqcPublicKey } = req.body ?? {};
+
+  // Validated before any I/O so malformed input is rejected cheaply and does
+  // not depend on the database being reachable.
+  const credentialError = validateNewCredentials({ username, password });
+  if (credentialError) return res.status(400).json({ error: credentialError });
+
+  // Rejected here as well as in the schema: an over-long key would later be
+  // copied into a fixed-size WASM allocation by every peer messaging this user.
+  const keyError = validatePublicKey(pqcPublicKey);
+  if (keyError) return res.status(400).json({ error: keyError });
 
   try {
     await dbConnect();
-    // 1. Accept pqcPublicKey from the request body
-    const { username, password, pqcPublicKey } = req.body;
 
-    if (!username || !password || !pqcPublicKey) {
-      return res.status(400).json({ error: 'Username, Password, and Public Key are required' });
-    }
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_COST);
 
-    // 2. Hash password
-    const hashedPassword = await bcrypt.hash(password, 12);
-
-    // 3. Create user with the Public Key
-    const newUser = await User.create({
+    await User.create({
       username,
       password: hashedPassword,
-      pqcPublicKey 
+      pqcPublicKey: pqcPublicKey.trim(),
     });
 
-    res.status(201).json({ message: 'User created successfully' });
+    return res.status(201).json({ message: 'User created successfully' });
   } catch (error) {
-    console.error("Register Error:", error);
-    res.status(500).json({ error: 'Registration failed (Username might be taken)' });
+    if (error?.code === 11000) {
+      return res.status(409).json({ error: 'That username is already taken.' });
+    }
+    if (error?.name === 'ValidationError') {
+      return res.status(400).json({ error: 'Invalid registration details.' });
+    }
+    console.error('Register error:', error);
+    return res.status(500).json({ error: 'Registration failed. Please try again.' });
   }
 }

@@ -1,234 +1,263 @@
-// import { MlKem512 } from 'crystals-kyber-js';
+/**
+ * Client-side hybrid encryption: Kyber-512 KEM (compiled C, via WebAssembly)
+ * for key encapsulation, AES-256-GCM (WebCrypto) for the message itself.
+ *
+ * Private keys and shared secrets never leave the browser.
+ */
 
-// // --- HELPER FUNCTIONS ---
-// const fromHex = (hexString) => 
-//   new Uint8Array(hexString.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+import { fromHex, toHex } from './hex';
+import {
+  CIPHERTEXT_BYTES,
+  PUBLIC_KEY_BYTES,
+  SECRET_KEY_BYTES,
+  SHARED_SECRET_BYTES,
+} from './pqcParams';
 
-// const toHex = (bytes) => 
-//   bytes.reduce((str, byte) => str + byte.toString(16).padStart(2, '0'), '');
+const AES_IV_BYTES = 12;
+const WASM_READY_TIMEOUT_MS = 15000;
 
-// // --- 1. ENCRYPT (Sender) ---
-// export async function encryptMessage(recipientPubKeyHex, messageText) {
-//   try {
-//     console.log("🔒 [CLIENT-SIDE ENCRYPTION START]");
-//     console.log("   Original Message:", messageText);
-    
-//     const pubKeyBytes = fromHex(recipientPubKeyHex);
+let modulePromise = null;
+let cachedParams = null;
 
-//     // KEM Encapsulation
-//     console.log("   Step 1: Generating Shared Secret using Kyber-512 (KEM)...");
-//     const sender = new MlKem512();
-//     const [ciphertext, sharedSecret] = await sender.encap(pubKeyBytes);
-//     console.log("   --> Shared Secret Generated (Client-Only):", toHex(new Uint8Array(sharedSecret)).substring(0, 20) + "...");
+/**
+ * Resolve once the Emscripten runtime is genuinely usable.
+ *
+ * `calledRun` is the only reliable readiness signal. Emscripten pre-defines
+ * every export as a throwing stub, so probing for `_malloc` succeeds before the
+ * module is initialised, and `onRuntimeInitialized` becomes a setter-only
+ * property that always reads back as undefined (and aborts if assigned).
+ */
+export function getWasmModule() {
+  if (modulePromise) return modulePromise;
 
-//     // AES Encryption
-//     console.log("   Step 2: Encrypting text with AES-GCM using Shared Secret...");
-//     const aesKey = await window.crypto.subtle.importKey(
-//         "raw", sharedSecret, "AES-GCM", false, ["encrypt"]
-//     );
-
-//     const iv = window.crypto.getRandomValues(new Uint8Array(12));
-//     const encodedMsg = new TextEncoder().encode(messageText);
-
-//     const encryptedContent = await window.crypto.subtle.encrypt(
-//         { name: "AES-GCM", iv: iv }, aesKey, encodedMsg
-//     );
-    
-//     console.log("   --> Encryption Complete. Ciphertext ready to send.");
-//     console.log("🔒 [CLIENT-SIDE ENCRYPTION END]");
-
-//     return {
-//         kemCiphertext: toHex(ciphertext),
-//         aesIv: toHex(iv),
-//         encryptedMessage: toHex(new Uint8Array(encryptedContent))
-//     };
-//   } catch (err) {
-//     console.error("Encryption Failed:", err);
-//     throw new Error("PQC Encryption failed. Check keys.");
-//   }
-// }
-
-// // --- 2. DECRYPT (Receiver) ---
-// export async function decryptMessage(payload, myPrivateKeyHex) {
-//   try {
-//     console.log("🔓 [CLIENT-SIDE DECRYPTION START]");
-//     console.log("   Received Encrypted Payload:", payload.encryptedMessage.substring(0, 20) + "...");
-
-//     const { kemCiphertext, aesIv, encryptedMessage } = payload;
-//     const privKeyBytes = fromHex(myPrivateKeyHex);
-//     const ciphertextBytes = fromHex(kemCiphertext);
-
-//     // KEM Decapsulation
-//     console.log("   Step 1: Recovering Shared Secret using Kyber-512 (KEM)...");
-//     const recipient = new MlKem512();
-//     const sharedSecret = await recipient.decap(ciphertextBytes, privKeyBytes);
-//     console.log("   --> Shared Secret Recovered:", toHex(new Uint8Array(sharedSecret)).substring(0, 20) + "...");
-
-//     // AES Decryption
-//     console.log("   Step 2: Decrypting AES-GCM payload...");
-//     const aesKey = await window.crypto.subtle.importKey(
-//         "raw", sharedSecret, "AES-GCM", false, ["decrypt"]
-//     );
-
-//     const decryptedBuffer = await window.crypto.subtle.decrypt(
-//         { name: "AES-GCM", iv: fromHex(aesIv) },
-//         aesKey,
-//         fromHex(encryptedMessage)
-//     );
-
-//     const originalText = new TextDecoder().decode(decryptedBuffer);
-//     console.log("   --> Decryption Successful. Message recovered.");
-//     console.log("   Decrypted Text:", originalText);
-//     console.log("🔓 [CLIENT-SIDE DECRYPTION END]");
-
-//     return originalText;
-//   } catch (err) {
-//     console.error("Decryption Failed:", err);
-//     throw err;
-//   }
-// }
-
-
-// Remove the old JS library import
-// import { MlKem512 } from 'crystals-kyber-js'; 
-
-// Helper: Convert Hex to Uint8Array
-const fromHex = (hexString) => 
-  new Uint8Array(hexString.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-
-// Helper: Convert Uint8Array to Hex
-const toHex = (bytes) => 
-  bytes.reduce((str, byte) => str + byte.toString(16).padStart(2, '0'), '');
-
-// Helper to ensure WASM is ready
-const getWasmModule = async () => {
-    if (typeof window !== 'undefined' && window.Module && window.Module.onRuntimeInitialized) {
-        return window.Module;
+  modulePromise = new Promise((resolve, reject) => {
+    if (typeof window === 'undefined') {
+      reject(new Error('The post-quantum module is only available in the browser'));
+      return;
     }
-    // Simple polling wait if not ready yet
-    return new Promise((resolve) => {
-        const check = setInterval(() => {
-            if (window.Module && window.Module._malloc) { // Check for a known function
-                clearInterval(check);
-                resolve(window.Module);
-            }
-        }, 100);
-    });
-};
 
-// --- 1. ENCRYPT (Using C Code) ---
-export async function encryptMessage(recipientPubKeyHex, messageText) {
-  try {
-    const Module = await getWasmModule();
-    console.log("🔒 [C-WASM] Encrypting...");
-
-    // 1. Prepare Data
-    const pubKeyBytes = fromHex(recipientPubKeyHex);
-    
-    // 2. Allocate Memory in C
-    const pkSize = Module._get_pubkey_size();
-    const ctSize = Module._get_ciphertext_size();
-    const ssSize = Module._get_shared_secret_size();
-
-    const pkPtr = Module._malloc(pkSize);
-    const ctPtr = Module._malloc(ctSize);
-    const ssPtr = Module._malloc(ssSize);
-
-    // 3. Copy Public Key to C Memory
-    Module.HEAPU8.set(pubKeyBytes, pkPtr);
-
-    // 4. CALL C FUNCTION: encapsulate_kyber(ct, ss, pk)
-    Module._encapsulate_kyber(ctPtr, ssPtr, pkPtr);
-
-    // 5. Read Result (Ciphertext & Shared Secret)
-    const ciphertextBytes = new Uint8Array(Module.HEAPU8.buffer, ctPtr, ctSize);
-    const sharedSecretBytes = new Uint8Array(Module.HEAPU8.buffer, ssPtr, ssSize);
-
-    // Copy to JS memory (because we are about to free C memory)
-    const sharedSecret = new Uint8Array(sharedSecretBytes);
-    const ciphertextHex = toHex(ciphertextBytes);
-
-    // 6. Free C Memory
-    Module._free(pkPtr);
-    Module._free(ctPtr);
-    Module._free(ssPtr);
-
-    // 7. AES Encryption (Standard JS WebCrypto)
-    const aesKey = await window.crypto.subtle.importKey(
-        "raw", sharedSecret, "AES-GCM", false, ["encrypt"]
-    );
-
-    const iv = window.crypto.getRandomValues(new Uint8Array(12));
-    const encodedMsg = new TextEncoder().encode(messageText);
-
-    const encryptedContent = await window.crypto.subtle.encrypt(
-        { name: "AES-GCM", iv: iv }, aesKey, encodedMsg
-    );
-
-    console.log("🔒 [C-WASM] Encryption Complete.");
-
-    return {
-        kemCiphertext: ciphertextHex,
-        aesIv: toHex(iv),
-        encryptedMessage: toHex(new Uint8Array(encryptedContent))
+    const deadline = Date.now() + WASM_READY_TIMEOUT_MS;
+    const poll = () => {
+      if (window.Module?.calledRun) {
+        resolve(window.Module);
+        return;
+      }
+      if (Date.now() > deadline) {
+        modulePromise = null; // allow a later retry
+        reject(new Error('The post-quantum module failed to load. Please reload the page.'));
+        return;
+      }
+      setTimeout(poll, 50);
     };
+    poll();
+  });
 
-  } catch (err) {
-    console.error("WASM Encryption Failed:", err);
-    throw new Error("WASM PQC Encryption failed.");
+  return modulePromise;
+}
+
+/**
+ * Read the algorithm parameters the module was built with and confirm they
+ * match what the rest of the app expects. A mismatch means the WASM was rebuilt
+ * against a different algorithm, which must not silently change buffer sizes.
+ */
+function readParams(Module) {
+  if (cachedParams) return cachedParams;
+
+  const params = {
+    publicKeyBytes: Module._get_pubkey_size(),
+    secretKeyBytes: Module._get_privkey_size(),
+    ciphertextBytes: Module._get_ciphertext_size(),
+    sharedSecretBytes: Module._get_shared_secret_size(),
+  };
+
+  const expected = {
+    publicKeyBytes: PUBLIC_KEY_BYTES,
+    secretKeyBytes: SECRET_KEY_BYTES,
+    ciphertextBytes: CIPHERTEXT_BYTES,
+    sharedSecretBytes: SHARED_SECRET_BYTES,
+  };
+
+  for (const [name, value] of Object.entries(expected)) {
+    if (params[name] !== value) {
+      throw new Error(`WASM parameter mismatch: ${name} is ${params[name]}, expected ${value}`);
+    }
+  }
+
+  cachedParams = params;
+  return params;
+}
+
+/**
+ * The currently bundled WASM declares the KEM wrappers as `void`, so calls
+ * return undefined. keygen.c now returns an int status instead; treating
+ * undefined as success keeps the existing binary working while making the
+ * status meaningful as soon as the module is rebuilt.
+ */
+function assertKemOk(status, operation) {
+  if (typeof status === 'number' && status !== 0) {
+    throw new Error(`${operation} failed (status ${status})`);
   }
 }
 
-// --- 2. DECRYPT (Using C Code) ---
-export async function decryptMessage(payload, myPrivateKeyHex) {
+/**
+ * Tracks WASM heap allocations so every one is wiped and freed, including on
+ * the error path. `free` alone would leave key material readable in the heap.
+ */
+class Scratch {
+  constructor(Module) {
+    this.Module = Module;
+    this.blocks = [];
+  }
+
+  alloc(size) {
+    const ptr = this.Module._malloc(size);
+    if (!ptr) throw new Error('WASM memory allocation failed');
+    this.blocks.push({ ptr, size });
+    return ptr;
+  }
+
+  /** Copy exactly `size` bytes; a mismatch would write past the allocation. */
+  write(ptr, bytes, size) {
+    if (bytes.length !== size) {
+      throw new Error(`Refusing to write ${bytes.length} bytes into a ${size}-byte buffer`);
+    }
+    this.Module.HEAPU8.set(bytes, ptr);
+  }
+
+  read(ptr, size) {
+    return new Uint8Array(this.Module.HEAPU8.buffer, ptr, size).slice();
+  }
+
+  release() {
+    for (const { ptr, size } of this.blocks) {
+      this.Module.HEAPU8.fill(0, ptr, ptr + size);
+      this.Module._free(ptr);
+    }
+    this.blocks.length = 0;
+  }
+}
+
+/** Encapsulate to one public key and seal the plaintext under the shared secret. */
+async function sealTo(Module, params, publicKeyHex, plaintextBytes) {
+  const scratch = new Scratch(Module);
+  let sharedSecret = null;
+
   try {
-    const Module = await getWasmModule();
-    console.log("🔓 [C-WASM] Decrypting...");
+    // Length is enforced during decoding, so the copy below can never overrun.
+    const publicKey = fromHex(publicKeyHex, params.publicKeyBytes);
 
-    const { kemCiphertext, aesIv, encryptedMessage } = payload;
-    const privKeyBytes = fromHex(myPrivateKeyHex);
-    const ciphertextBytes = fromHex(kemCiphertext);
+    const pkPtr = scratch.alloc(params.publicKeyBytes);
+    const ctPtr = scratch.alloc(params.ciphertextBytes);
+    const ssPtr = scratch.alloc(params.sharedSecretBytes);
 
-    // 1. Allocate Memory in C
-    const skSize = Module._get_privkey_size();
-    const ctSize = Module._get_ciphertext_size();
-    const ssSize = Module._get_shared_secret_size();
+    scratch.write(pkPtr, publicKey, params.publicKeyBytes);
+    assertKemOk(Module._encapsulate_kyber(ctPtr, ssPtr, pkPtr), 'KEM encapsulation');
 
-    const skPtr = Module._malloc(skSize);
-    const ctPtr = Module._malloc(ctSize);
-    const ssPtr = Module._malloc(ssSize);
+    const kemCiphertext = scratch.read(ctPtr, params.ciphertextBytes);
+    sharedSecret = scratch.read(ssPtr, params.sharedSecretBytes);
 
-    // 2. Copy Data to C Memory
-    Module.HEAPU8.set(privKeyBytes, skPtr);
-    Module.HEAPU8.set(ciphertextBytes, ctPtr);
+    const iv = window.crypto.getRandomValues(new Uint8Array(AES_IV_BYTES));
+    const aesKey = await window.crypto.subtle.importKey('raw', sharedSecret, 'AES-GCM', false, [
+      'encrypt',
+    ]);
+    const sealed = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, plaintextBytes);
 
-    // 3. CALL C FUNCTION: decapsulate_kyber(ss, ct, sk)
-    Module._decapsulate_kyber(ssPtr, ctPtr, skPtr);
+    return {
+      kemCiphertext: toHex(kemCiphertext),
+      aesIv: toHex(iv),
+      encryptedMessage: toHex(new Uint8Array(sealed)),
+    };
+  } finally {
+    sharedSecret?.fill(0);
+    scratch.release();
+  }
+}
 
-    // 4. Read Shared Secret
-    const sharedSecretBytes = new Uint8Array(Module.HEAPU8.buffer, ssPtr, ssSize);
-    const sharedSecret = new Uint8Array(sharedSecretBytes); // Copy
+/**
+ * Encrypt a message for the recipient, plus a second copy encapsulated to the
+ * sender's own key so they can re-read their own history.
+ *
+ * @param {string} recipientPublicKeyHex
+ * @param {string|null} senderPublicKeyHex omit to skip the sender's copy
+ * @param {string} messageText
+ */
+export async function encryptMessage(recipientPublicKeyHex, senderPublicKeyHex, messageText) {
+  const Module = await getWasmModule();
+  const params = readParams(Module);
+  const plaintext = new TextEncoder().encode(messageText);
 
-    // 5. Free C Memory
-    Module._free(skPtr);
-    Module._free(ctPtr);
-    Module._free(ssPtr);
+  try {
+    const envelope = await sealTo(Module, params, recipientPublicKeyHex, plaintext);
+    if (senderPublicKeyHex) {
+      envelope.senderCopy = await sealTo(Module, params, senderPublicKeyHex, plaintext);
+    }
+    return envelope;
+  } finally {
+    plaintext.fill(0);
+  }
+}
 
-    // 6. AES Decryption
-    const aesKey = await window.crypto.subtle.importKey(
-        "raw", sharedSecret, "AES-GCM", false, ["decrypt"]
-    );
+/**
+ * Decapsulate and open one envelope.
+ *
+ * Kyber decapsulation uses implicit rejection: a wrong secret key yields a
+ * different shared secret rather than an error, so it is the AES-GCM
+ * authentication tag that actually rejects a mismatched key. The key-ownership
+ * check on the chat screen relies on this.
+ */
+export async function decryptMessage(envelope, secretKeyHex) {
+  const Module = await getWasmModule();
+  const params = readParams(Module);
+  const scratch = new Scratch(Module);
+  let sharedSecret = null;
+  let secretKey = null;
 
-    const decryptedBuffer = await window.crypto.subtle.decrypt(
-        { name: "AES-GCM", iv: fromHex(aesIv) },
-        aesKey,
-        fromHex(encryptedMessage)
-    );
+  try {
+    secretKey = fromHex(secretKeyHex, params.secretKeyBytes);
+    const kemCiphertext = fromHex(envelope?.kemCiphertext, params.ciphertextBytes);
+    const iv = fromHex(envelope?.aesIv, AES_IV_BYTES);
+    const sealed = fromHex(envelope?.encryptedMessage);
 
-    return new TextDecoder().decode(decryptedBuffer);
+    const skPtr = scratch.alloc(params.secretKeyBytes);
+    const ctPtr = scratch.alloc(params.ciphertextBytes);
+    const ssPtr = scratch.alloc(params.sharedSecretBytes);
 
-  } catch (err) {
-    console.error("WASM Decryption Failed:", err);
-    throw err;
+    scratch.write(skPtr, secretKey, params.secretKeyBytes);
+    scratch.write(ctPtr, kemCiphertext, params.ciphertextBytes);
+
+    assertKemOk(Module._decapsulate_kyber(ssPtr, ctPtr, skPtr), 'KEM decapsulation');
+    sharedSecret = scratch.read(ssPtr, params.sharedSecretBytes);
+
+    const aesKey = await window.crypto.subtle.importKey('raw', sharedSecret, 'AES-GCM', false, [
+      'decrypt',
+    ]);
+    const opened = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, sealed);
+
+    return new TextDecoder().decode(opened);
+  } finally {
+    secretKey?.fill(0);
+    sharedSecret?.fill(0);
+    scratch.release();
+  }
+}
+
+/** Generate a fresh Kyber keypair. Returns lowercase hex. */
+export async function generateKeyPair() {
+  const Module = await getWasmModule();
+  const params = readParams(Module);
+  const scratch = new Scratch(Module);
+
+  try {
+    const pkPtr = scratch.alloc(params.publicKeyBytes);
+    const skPtr = scratch.alloc(params.secretKeyBytes);
+
+    assertKemOk(Module._generate_kyber_keys(pkPtr, skPtr), 'Key generation');
+
+    return {
+      publicKey: toHex(scratch.read(pkPtr, params.publicKeyBytes)),
+      privateKey: toHex(scratch.read(skPtr, params.secretKeyBytes)),
+    };
+  } finally {
+    scratch.release();
   }
 }

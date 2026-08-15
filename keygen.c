@@ -1,90 +1,103 @@
-// #include <stdio.h>
-// #include <stdlib.h>
-// #include <string.h>
-// #include <oqs/oqs.h>
-// #include <emscripten.h> 
+/*
+ * Kyber-512 wrappers exposed to JavaScript through Emscripten.
+ *
+ * All three operations return an int status (0 = success) so that a failure in
+ * liboqs cannot be mistaken for success by the caller. Previously they were
+ * `void`, so a failed OQS_KEM_new left the caller reading uninitialised heap as
+ * if it were key material.
+ *
+ * Rebuild with:
+ *   emcc keygen.c -I<liboqs>/include -L<liboqs>/lib -loqs -O3 -sASSERTIONS=0 \
+ *     -sEXPORTED_FUNCTIONS='["_generate_kyber_keys","_encapsulate_kyber",\
+ *       "_decapsulate_kyber","_get_pubkey_size","_get_privkey_size",\
+ *       "_get_ciphertext_size","_get_shared_secret_size","_malloc","_free"]' \
+ *     -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap"]' -o public/wasm_keygen.js
+ */
 
-// // 1. Function to Generate Keys (Called from JS)
-// EMSCRIPTEN_KEEPALIVE
-// void generate_kyber_keys(uint8_t *public_key, uint8_t *secret_key) {
-//     // Initialize Kyber-512
-//     OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_kyber_512);
-//     if (kem == NULL) return;
-
-//     // Generate keys directly into the memory JavaScript gave us
-//     OQS_KEM_keypair(kem, public_key, secret_key);
-
-//     // Cleanup
-//     OQS_KEM_free(kem);
-// }
-
-// // 2. Helper: Tell JS the Public Key size is 800 bytes
-// EMSCRIPTEN_KEEPALIVE
-// int get_pubkey_size() {
-//     return 800; 
-// }
-
-// // 3. Helper: Tell JS the Private Key size is 1632 bytes
-// EMSCRIPTEN_KEEPALIVE
-// int get_privkey_size() {
-//     return 1632; 
-// }
-
-//---------
-#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
+
+#include <emscripten.h>
 #include <oqs/oqs.h>
-#include <emscripten.h> 
 
-// Constants for Kyber-512
-// We define them here so we can use them in multiple functions safely
-#define KYBER_PUBKEY_SIZE 800
-#define KYBER_PRIVKEY_SIZE 1632
-#define KYBER_CIPHERTEXT_SIZE 768
-#define KYBER_SHARED_SECRET_SIZE 32
+#define KEM_ALGORITHM OQS_KEM_alg_kyber_512
 
-// --- 1. KEY GENERATION (This is the code you provided) ---
-EMSCRIPTEN_KEEPALIVE
-void generate_kyber_keys(uint8_t *public_key, uint8_t *secret_key) {
-    // Initialize Kyber-512
-    OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_kyber_512);
-    if (kem == NULL) return;
+#define STATUS_OK 0
+#define STATUS_KEM_UNAVAILABLE (-1)
+#define STATUS_OPERATION_FAILED (-2)
 
-    // Generate keys directly into the memory pointers provided by JS
-    OQS_KEM_keypair(kem, public_key, secret_key);
+/*
+ * A single KEM instance is reused for every call. WebAssembly is
+ * single-threaded here, so this is safe, and it avoids allocating and freeing
+ * an OQS_KEM for every message.
+ */
+static OQS_KEM *kem_instance = NULL;
 
-    // Cleanup
-    OQS_KEM_free(kem);
+static OQS_KEM *get_kem(void) {
+    if (kem_instance == NULL) {
+        kem_instance = OQS_KEM_new(KEM_ALGORITHM);
+    }
+    return kem_instance;
 }
 
-// --- 2. ENCAPSULATION (Encryption) ---
-// This function generates the Shared Secret and the Ciphertext using the Receiver's Public Key
 EMSCRIPTEN_KEEPALIVE
-void encapsulate_kyber(uint8_t *ciphertext, uint8_t *shared_secret, uint8_t *public_key) {
-    OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_kyber_512);
-    if (kem == NULL) return;
-    
-    OQS_KEM_encaps(kem, ciphertext, shared_secret, public_key);
-    
-    OQS_KEM_free(kem);
+int generate_kyber_keys(uint8_t *public_key, uint8_t *secret_key) {
+    OQS_KEM *kem = get_kem();
+    if (kem == NULL) return STATUS_KEM_UNAVAILABLE;
+
+    if (OQS_KEM_keypair(kem, public_key, secret_key) != OQS_SUCCESS) {
+        return STATUS_OPERATION_FAILED;
+    }
+    return STATUS_OK;
 }
 
-// --- 3. DECAPSULATION (Decryption) ---
-// This function recovers the Shared Secret using the Receiver's Private Key
 EMSCRIPTEN_KEEPALIVE
-void decapsulate_kyber(uint8_t *shared_secret, uint8_t *ciphertext, uint8_t *secret_key) {
-    OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_kyber_512);
-    if (kem == NULL) return;
-    
-    OQS_KEM_decaps(kem, shared_secret, ciphertext, secret_key);
-    
-    OQS_KEM_free(kem);
+int encapsulate_kyber(uint8_t *ciphertext, uint8_t *shared_secret, const uint8_t *public_key) {
+    OQS_KEM *kem = get_kem();
+    if (kem == NULL) return STATUS_KEM_UNAVAILABLE;
+
+    if (OQS_KEM_encaps(kem, ciphertext, shared_secret, public_key) != OQS_SUCCESS) {
+        return STATUS_OPERATION_FAILED;
+    }
+    return STATUS_OK;
 }
 
-// --- 4. MEMORY SIZE HELPERS ---
-// JS needs to know how much memory to allocate for each operation
-EMSCRIPTEN_KEEPALIVE int get_pubkey_size() { return KYBER_PUBKEY_SIZE; }
-EMSCRIPTEN_KEEPALIVE int get_privkey_size() { return KYBER_PRIVKEY_SIZE; }
-EMSCRIPTEN_KEEPALIVE int get_ciphertext_size() { return KYBER_CIPHERTEXT_SIZE; }
-EMSCRIPTEN_KEEPALIVE int get_shared_secret_size() { return KYBER_SHARED_SECRET_SIZE; }
+EMSCRIPTEN_KEEPALIVE
+int decapsulate_kyber(uint8_t *shared_secret, const uint8_t *ciphertext, const uint8_t *secret_key) {
+    OQS_KEM *kem = get_kem();
+    if (kem == NULL) return STATUS_KEM_UNAVAILABLE;
+
+    if (OQS_KEM_decaps(kem, shared_secret, ciphertext, secret_key) != OQS_SUCCESS) {
+        return STATUS_OPERATION_FAILED;
+    }
+    return STATUS_OK;
+}
+
+/*
+ * Buffer sizes are read from the KEM itself rather than hardcoded, so they stay
+ * correct if the algorithm is ever changed. A zero return means the KEM is
+ * unavailable; the JavaScript side validates these against its expected values.
+ */
+EMSCRIPTEN_KEEPALIVE
+int get_pubkey_size(void) {
+    OQS_KEM *kem = get_kem();
+    return kem ? (int)kem->length_public_key : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int get_privkey_size(void) {
+    OQS_KEM *kem = get_kem();
+    return kem ? (int)kem->length_secret_key : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int get_ciphertext_size(void) {
+    OQS_KEM *kem = get_kem();
+    return kem ? (int)kem->length_ciphertext : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int get_shared_secret_size(void) {
+    OQS_KEM *kem = get_kem();
+    return kem ? (int)kem->length_shared_secret : 0;
+}
